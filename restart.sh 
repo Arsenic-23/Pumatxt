@@ -1,0 +1,9 @@
+#!/bin/bash
+
+# Loop to keep the bot running
+while true; do
+    echo "Starting Telegram bot..."
+    python3 bot.py  # Run the bot
+    echo "Bot crashed! Restarting in 5 seconds..."
+    sleep 5  # Wait before restarting
+done
