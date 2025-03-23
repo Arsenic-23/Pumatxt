@@ -1,12 +1,12 @@
 import os
-import json
 import logging
-from telegram import Update, Document
+from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters, CallbackContext
+    Application, CommandHandler, MessageHandler, filters, CallbackContext,
+    ConversationHandler
 )
 from dotenv import load_dotenv
-from utils import check_password, verify_user, is_verified, change_password, txt_to_vcf
+from utils import check_password, verify_user, is_verified, change_password, txt_to_vcf, load_config
 
 # Load environment variables
 load_dotenv()
@@ -16,16 +16,15 @@ OWNER_ID = 7706131450  # Replace with your actual Telegram user ID
 # Configure logging
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# Store temporary data for user interactions
-user_data = {}
-
-CONFIG_FILE = "config.json"
+# Conversation states
+PASSWORD, FILE, CONTACT_NAME, VCF_NAME = range(4)
 
 # Start command
 async def start(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-    user_data[user_id] = {"step": "awaiting_password"}  # Reset user data
-    await update.message.reply_text("Welcome! Please enter the bot password to proceed.")
+    context.user_data.clear()  # Reset user data
+    await update.message.reply_text("🔐 Enter the bot password to continue:")
+    return PASSWORD
 
 # Password handler
 async def password_handler(update: Update, context: CallbackContext):
@@ -34,14 +33,15 @@ async def password_handler(update: Update, context: CallbackContext):
 
     if is_verified(user_id):
         await update.message.reply_text("✅ You are already verified! Send a .txt file to convert.")
-        return
+        return FILE
 
     if check_password(user_id, password):
         verify_user(user_id)
-        user_data[user_id] = {"step": "awaiting_file"}  # Move to next step
-        await update.message.reply_text("✅ Password correct! Send a .txt file to convert.")
+        await update.message.reply_text("✅ Password correct! Now send a .txt file to convert.")
+        return FILE
     else:
-        await update.message.reply_text("❌ Incorrect password. Please try again.")
+        await update.message.reply_text("❌ Incorrect password. Try again.")
+        return PASSWORD
 
 # Handle received text files
 async def handle_document(update: Update, context: CallbackContext):
@@ -49,45 +49,46 @@ async def handle_document(update: Update, context: CallbackContext):
 
     if not is_verified(user_id):
         await update.message.reply_text("❌ You must enter the correct password first.")
-        return
+        return PASSWORD
 
     file = update.message.document
     if file.mime_type != "text/plain":
         await update.message.reply_text("❌ Please send a valid .txt file.")
-        return
+        return FILE
 
     file_path = f"downloads/{file.file_name}"
     os.makedirs("downloads", exist_ok=True)
     new_file = await file.get_file()
     await new_file.download_to_drive(file_path)
 
-    user_data[user_id] = {"step": "awaiting_contact_name", "file_path": file_path}
-    await update.message.reply_text("📌 Please enter a base name for contacts (or type 'auto' to auto-generate).")
+    context.user_data["file_path"] = file_path
+    await update.message.reply_text("📌 Enter a base name for contacts (or type 'auto' to auto-generate).")
+    return CONTACT_NAME
 
 # Handle contact naming
 async def handle_contact_name(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     name = update.message.text.strip()
 
-    if user_id not in user_data or user_data[user_id]["step"] != "awaiting_contact_name":
+    if "file_path" not in context.user_data:
         await update.message.reply_text("❌ Please send a .txt file first.")
-        return
+        return FILE
 
-    user_data[user_id]["contact_name"] = name
-    user_data[user_id]["step"] = "awaiting_vcf_name"
+    context.user_data["contact_name"] = name
     await update.message.reply_text("📌 Now enter a name for the .vcf file.")
+    return VCF_NAME
 
 # Handle VCF file naming
 async def handle_vcf_name(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     vcf_name = update.message.text.strip()
 
-    if user_id not in user_data or user_data[user_id]["step"] != "awaiting_vcf_name":
+    if "contact_name" not in context.user_data:
         await update.message.reply_text("❌ Please enter the contact name first.")
-        return
+        return CONTACT_NAME
 
-    txt_file = user_data[user_id]["file_path"]
-    contact_name = user_data[user_id]["contact_name"]
+    txt_file = context.user_data["file_path"]
+    contact_name = context.user_data["contact_name"]
     vcf_file = f"downloads/{vcf_name}.vcf"
 
     txt_to_vcf(txt_file, vcf_file, contact_name)
@@ -95,7 +96,8 @@ async def handle_vcf_name(update: Update, context: CallbackContext):
     await update.message.reply_document(document=open(vcf_file, "rb"), filename=vcf_name + ".vcf")
     await update.message.reply_text("✅ Here is your converted .vcf file!")
 
-    del user_data[user_id]  # Clear temporary data
+    context.user_data.clear()  # Clear user data
+    return FILE  # Allow user to send another file without restarting
 
 # Change password (owner only)
 async def change_password_command(update: Update, context: CallbackContext):
@@ -132,19 +134,30 @@ async def status_command(update: Update, context: CallbackContext):
     verified_count = len(config["verified_users"])
     await update.message.reply_text(f"✅ Bot is running.\n👥 Verified users: {verified_count}")
 
+# Cancel command
+async def cancel(update: Update, context: CallbackContext):
+    await update.message.reply_text("❌ Process cancelled. Send /start to begin again.")
+    return ConversationHandler.END
+
 # Main function
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, password_handler)],
+            FILE: [MessageHandler(filters.Document.ALL & filters.Document.MimeType("text/plain"), handle_document)],
+            CONTACT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact_name)],
+            VCF_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vcf_name)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+
+    app.add_handler(conv_handler)
     app.add_handler(CommandHandler("changepass", change_password_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status_command))
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, password_handler))
-    app.add_handler(MessageHandler(filters.Document.ALL & filters.Document.MimeType("text/plain"), handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact_name))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vcf_name))
 
     app.run_polling()
 
