@@ -1,0 +1,149 @@
+import os
+import json
+import logging
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from utils import check_password, verify_user, is_verified, change_password, txt_to_vcf
+
+# Configure logging
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+
+# Load bot token
+TOKEN = "YOUR_BOT_TOKEN"
+CONFIG_FILE = "config.json"
+
+# Store temporary data for naming files
+user_data = {}
+
+# Load config
+def load_config():
+    with open(CONFIG_FILE, "r") as file:
+        return json.load(file)
+
+# Start command
+def start(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    update.message.reply_text("Welcome! Please enter the bot password to proceed.")
+
+# Password handler
+def password_handler(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    password = update.message.text.strip()
+
+    if is_verified(user_id):
+        update.message.reply_text("✅ You are already verified! Send a .txt file to convert.")
+        return
+
+    if check_password(user_id, password):
+        verify_user(user_id)
+        update.message.reply_text("✅ Password correct! Send a .txt file to convert.")
+    else:
+        update.message.reply_text("❌ Incorrect password. Please try again.")
+
+# Handle received text files
+def handle_document(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+
+    if not is_verified(user_id):
+        update.message.reply_text("❌ You must enter the correct password first.")
+        return
+
+    file = update.message.document
+    if file.mime_type != "text/plain":
+        update.message.reply_text("❌ Please send a valid .txt file.")
+        return
+
+    file_path = f"downloads/{file.file_name}"
+    os.makedirs("downloads", exist_ok=True)
+    file.download(file_path)
+
+    user_data[user_id] = {"file_path": file_path}
+    update.message.reply_text("📌 Please enter a base name for contacts (or type 'auto' to auto-generate).")
+
+# Handle contact naming
+def handle_contact_name(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    name = update.message.text.strip()
+
+    if user_id not in user_data or "file_path" not in user_data[user_id]:
+        update.message.reply_text("❌ Please send a .txt file first.")
+        return
+
+    user_data[user_id]["contact_name"] = name
+    update.message.reply_text("📌 Now enter a name for the .vcf file.")
+
+# Handle VCF file naming
+def handle_vcf_name(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    vcf_name = update.message.text.strip()
+
+    if user_id not in user_data or "contact_name" not in user_data[user_id]:
+        update.message.reply_text("❌ Please enter the contact name first.")
+        return
+
+    txt_file = user_data[user_id]["file_path"]
+    contact_name = user_data[user_id]["contact_name"]
+    vcf_file = f"downloads/{vcf_name}.vcf"
+
+    txt_to_vcf(txt_file, vcf_file, contact_name)
+
+    update.message.reply_document(document=open(vcf_file, "rb"), filename=vcf_name + ".vcf")
+    update.message.reply_text("✅ Here is your converted .vcf file!")
+
+    del user_data[user_id]  # Clear temporary data
+
+# Change password (owner only)
+def change_password_command(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    if user_id != int(os.getenv("OWNER_ID", "YOUR_TELEGRAM_USER_ID")):
+        update.message.reply_text("❌ You are not authorized to change the password.")
+        return
+
+    if len(context.args) != 1:
+        update.message.reply_text("Usage: /changepass <new_password>")
+        return
+
+    new_password = context.args[0]
+    change_password(new_password)
+    update.message.reply_text("🔒 Password has been changed. All users must re-enter the new password.")
+
+# Help command
+def help_command(update: Update, context: CallbackContext) -> None:
+    help_text = """
+🔹 Send a .txt file to convert it to .vcf.
+🔹 If no contact names are found, you will be asked to enter one.
+🔹 You can rename the .vcf file before receiving it.
+🔹 Commands:
+  /start - Restart from the beginning
+  /changepass <new_pass> - Change password (Owner only)
+  /status - Check bot status
+  /help - Show this help menu
+"""
+    update.message.reply_text(help_text)
+
+# Status command
+def status_command(update: Update, context: CallbackContext) -> None:
+    config = load_config()
+    verified_count = len(config["verified_users"])
+    update.message.reply_text(f"✅ Bot is running.\n👥 Verified users: {verified_count}")
+
+# Main function
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("changepass", change_password_command, pass_args=True))
+    dp.add_handler(CommandHandler("help", help_command))
+    dp.add_handler(CommandHandler("status", status_command))
+
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, password_handler))
+    dp.add_handler(MessageHandler(Filters.document.mime_type("text/plain"), handle_document))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_contact_name))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_vcf_name))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
