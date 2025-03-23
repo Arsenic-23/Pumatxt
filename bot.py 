@@ -1,9 +1,9 @@
 import os
 import json
 import logging
-from telegram import Update, Document
+from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters
+    Application, CommandHandler, MessageHandler, filters, ContextTypes
 )
 from dotenv import load_dotenv
 from utils import check_password, verify_user, is_verified, change_password, txt_to_vcf
@@ -16,18 +16,29 @@ OWNER_ID = 7706131450  # Replace with your actual Telegram user ID
 # Configure logging
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# Store temporary data for user interactions
+# Store temporary user data
 user_data = {}
 
 CONFIG_FILE = "config.json"
 
+# Load configuration
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {"verified_users": []}
+    with open(CONFIG_FILE, "r") as file:
+        return json.load(file)
+
+# Save configuration
+def save_config(config):
+    with open(CONFIG_FILE, "w") as file:
+        json.dump(config, file)
+
 # Start command
-async def start(update: Update, context):
-    user_id = update.message.from_user.id
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome! Please enter the bot password to proceed.")
 
 # Password handler
-async def password_handler(update: Update, context):
+async def password_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     password = update.message.text.strip()
 
@@ -41,8 +52,8 @@ async def password_handler(update: Update, context):
     else:
         await update.message.reply_text("❌ Incorrect password. Please try again.")
 
-# Handle received text files
-async def handle_document(update: Update, context):
+# Handle .txt file upload
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
 
     if not is_verified(user_id):
@@ -63,11 +74,10 @@ async def handle_document(update: Update, context):
     await update.message.reply_text("📌 Please enter a base name for contacts (or type 'auto' to auto-generate).")
 
 # Handle contact naming
-async def handle_contact_name(update: Update, context):
+async def handle_contact_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     name = update.message.text.strip()
 
-    # Ensure this step only happens if the user sent a .txt file
     if user_id not in user_data or "file_path" not in user_data[user_id]:
         await update.message.reply_text("❌ Please send a .txt file first.")
         return
@@ -75,10 +85,17 @@ async def handle_contact_name(update: Update, context):
     user_data[user_id]["contact_name"] = name
     await update.message.reply_text("📌 Now enter a name for the .vcf file.")
 
+    # Change the handler to listen for VCF file name
+    context.user_data["awaiting_vcf_name"] = True
+
 # Handle VCF file naming
-async def handle_vcf_name(update: Update, context):
+async def handle_vcf_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     vcf_name = update.message.text.strip()
+
+    if not context.user_data.get("awaiting_vcf_name"):
+        await update.message.reply_text("❌ Please send a .txt file and enter a base contact name first.")
+        return
 
     if user_id not in user_data or "contact_name" not in user_data[user_id]:
         await update.message.reply_text("❌ Please enter the contact name first.")
@@ -88,15 +105,18 @@ async def handle_vcf_name(update: Update, context):
     contact_name = user_data[user_id]["contact_name"]
     vcf_file = f"downloads/{vcf_name}.vcf"
 
+    # Convert txt to vcf
     txt_to_vcf(txt_file, vcf_file, contact_name)
 
     await update.message.reply_document(document=open(vcf_file, "rb"), filename=vcf_name + ".vcf")
     await update.message.reply_text("✅ Here is your converted .vcf file!")
 
-    del user_data[user_id]  # Clear temporary data
+    # Clear temporary data
+    del user_data[user_id]
+    context.user_data["awaiting_vcf_name"] = False
 
 # Change password (owner only)
-async def change_password_command(update: Update, context):
+async def change_password_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id != OWNER_ID:
         await update.message.reply_text("❌ You are not authorized to change the password.")
@@ -111,7 +131,7 @@ async def change_password_command(update: Update, context):
     await update.message.reply_text("🔒 Password has been changed. All users must re-enter the new password.")
 
 # Help command
-async def help_command(update: Update, context):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 🔹 Send a .txt file to convert it to .vcf.
 🔹 If no contact names are found, you will be asked to enter one.
@@ -125,7 +145,7 @@ async def help_command(update: Update, context):
     await update.message.reply_text(help_text)
 
 # Status command
-async def status_command(update: Update, context):
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_config()
     verified_count = len(config["verified_users"])
     await update.message.reply_text(f"✅ Bot is running.\n👥 Verified users: {verified_count}")
@@ -142,6 +162,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, password_handler))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.Document.MimeType("text/plain"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact_name))
+
+    # Ensure VCF naming only triggers after contact name step
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vcf_name))
 
     app.run_polling()
